@@ -1,0 +1,4 @@
+anthropic==0.125.0
+openai==3.37.0
+pypdf==5.1.0
+strands-agents[anthropic]==1.62.0

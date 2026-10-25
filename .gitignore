@@ -3,7 +3,9 @@
 venv/
 .env
 
-# Generated caches (rebuilt by code/build_index.py)
+# Generated caches (rebuilt by code/tools/build_index.py or code/main.py)
 cache/
 __pycache__/
 *.pyc
+cache_backups/
+images/

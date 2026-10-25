@@ -85,10 +85,10 @@ Why both: `customer_data_snapshot_bundle_20260917.json` is filed on 09-17. One s
 Run once per machine. It rebuilds automatically when the dataset, the media extraction, or the builder code changes:
 ```
 python -m venv .venv && .venv/Scripts/pip install -r requirements.txt   # Windows (use .venv/bin/ on macOS/Linux)
-.venv/Scripts/python code/build_index.py            # writes cache/index.db (about 1 s)
-.venv/Scripts/python code/build_index.py --force    # unconditional rebuild
+.venv/Scripts/python code/tools/build_index.py            # writes cache/index.db (about 1 s)
+.venv/Scripts/python code/tools/build_index.py --force    # unconditional rebuild
 ```
-Code: `code/build_index.py` (CLI), plus `code/evidence_index/`: `normalize.py` (identifiers, record types, state rules), `parsers.py` (one per format), `reference.py` (CSVs), `model.py`, `schema.py`, `builder.py`.
+Code: `code/tools/build_index.py` (CLI), plus `code/stages/evidence_index/`: `normalize.py` (identifiers, record types, state rules), `parsers.py` (one per format), `reference.py` (CSVs), `model.py`, `schema.py`, `builder.py`.
 
 Behaviour worth knowing:
 - **Snapshot scopes.** Inventory and replica snapshots list only rows that exist, so absence is shown by omission. For example, case_01's `account_001` is ABSENT because evidence_54's tables don't contain it. `snapshot_scopes` records which system, store and time each snapshot covered, including zero-row scopes such as evidence_90, which covers 8 systems with no rows. Stage 3 uses scopes to infer ABSENT.
@@ -99,6 +99,101 @@ Behaviour worth knowing:
 - **Determinism.** Two forced builds produce byte-identical table contents (`built_at` excluded).
 
 Sample check: two-hop retrieval over the index (identifier → observation → resource, plus resource links) recovers **84/111 (76%)** of gold resources across the 32 samples. Every recovered resource's latest pre-audit `derived_state` agrees with its gold treatment. All 27 misses are resources that carry **no subject identifier in any evidence at or before `audit_at`**: deleted accounts and anonymized analytics, known only by id. One of them (`account_3866`, case_27) does carry identifiers, but only in a snapshot captured after the audit time, which is relevant to open decision 2 in §8.
+
+### 2.6 Stages 1-2 as built (`code/main.py`)
+- **Stage 1 (intent).** One Claude call per *distinct* request text: 375 for the 518 evaluation cases. The model is `claude-opus-5-5` at `effort: low`, with structured JSON output (`intent`, `request_type`, `language`, `rationale`) and `fallbacks: "default"`. No sampling parameters are sent; the API rejects them as of 2026-10-21. Determinism comes from the fixed prompt plus the cache: `cache/intent_cache.json`, keyed by SHA-256 of prompt version, model and text. Only successful verdicts are cached, so refusals, truncations, invalid JSON and API errors become `UNCLASSIFIED` with a flag and are retried on the next run. Missing credentials degrade to `UNCLASSIFIED` (`NO_CREDENTIALS`) instead of failing. The request text is wrapped in `<request_text>` tags and treated as data. A verdict whose `intent` disagrees with its `request_type` is flagged `INTENT_TYPE_MISMATCH`.
+- **Stage 2 (identity).** The request email is matched exactly and case-insensitively against current and historical emails. That yields the `user_id`, then every identifier with its validity window. Flags:
+  - `SUBJECT_NOT_RESOLVED`
+  - `AMBIGUOUS_SUBJECT`: the email belongs to more than one user, so none is picked
+  - `REQUEST_EMAIL_HISTORICAL`
+  - `REQUEST_EMAIL_CHANGED_AFTER_REQUEST`
+  - `IDENTIFIER_CHANGED_AFTER_AUDIT`
+  - `REPEAT_SUBJECT`: other cases about the same person, listed in `related_cases`
+
+  Names are kept for display but never used for matching. On the evaluation set: 418 current and 100 historical request emails, 0 unresolved, 1 repeat subject (`user_18`: case_33 and case_52).
+- `NOT_DELETION` cases skip stage 2. They become `NOT_APPLICABLE, []` in stage 6. The per-case result is written to `cache/case_results.jsonl`.
+
+### 2.7 Code layout (as built)
+```
+code/
+├── main.py              entry point (CLI only)
+├── pipeline/            main helpers: the driver (stages 0-7 in order) and the output gates
+├── lib/                 shared libraries: config, api, logger
+├── stages/              one module per stage (+ the evidence_index package for stage 0)
+├── tools/               standalone utilities: build_index.py, inspect_case.py
+└── evaluation/          evaluation and usage reports
+```
+Imports are package-qualified from `code/` (for example `from stages.identity import resolve_identities` or `from lib import api`). Entry scripts put `code/` on `sys.path`.
+
+| File | Role |
+|---|---|
+| `code/main.py` | CLI entry point only (`--samples`, `--cases`, `--no-model`, `--verbose`, `--allow-unclassified`) |
+| `code/pipeline/driver.py` | **Driver**: runs stages 0-7 in order, enforces the gates, decides where predictions are written |
+| `code/lib/config.py` | Repository-relative paths |
+| `code/lib/api.py` | Claude access: `.env` loading, credentials check, client, `structured_call` (refusal/truncation/error handling and usage logging in one place) |
+| `code/lib/logger.py` | Console messages, run log, usage log, JSONL artefacts, run summary, evaluation printout |
+| `code/stages/evidence_index/` | Stage 0 (index builder package) |
+| `code/stages/intent_classifier.py` | Stage 1 (prompt, schema, cache, `classify_intents`) |
+| `code/stages/identity.py` | Stage 2 (`resolve_identities`) |
+| `code/stages/retrieval.py` | Stage 3 (`retrieve` → case bundle) |
+| `code/stages/state_report.py` | Stage 4 contract (state-report schema, policy end states, compliance) and the deterministic **fallback** report used until the agent exists |
+| `code/stages/validator.py` | Stage 5 (`validate_report` against the bundle and rules, `validate_row` against the output contract) |
+| `code/stages/steps.py` | Stage 6 (`generate_steps`, `serialize_steps`) |
+| `code/stages/output.py` | Stage 7 (cross-case checks, `write_predictions`, `evaluate`) |
+| `code/tools/build_index.py`, `code/tools/inspect_case.py` | Rebuild the index by hand; print one case's retrieval result |
+
+**Fail-loud gates.**
+- **Stage 1 gate.** If any request is `UNCLASSIFIED` (no credentials, `--no-model` with no cached verdict, refusal, API error), the run **stops** after stage 1. It prints an error banner listing the reasons and cases, logs to `cache/run_log.jsonl`, and exits with code 2. `--allow-unclassified` exists for debugging only: it continues, treating those requests as deletions.
+- **Submission gate.** A full run writes `output.csv` only when every request is classified, every case passes stage-5 validation, and there is exactly one unique row per request. Otherwise the rows go to `cache/unverified_output.csv`, a banner explains why, and the run exits with code 2.
+- **Run log.** Every run logs start and end events to `cache/run_log.jsonl`: mode, case count, status counts, problems, model calls and tokens.
+
+Where predictions go: a full run writes `output.csv` at the repo root, `--samples` writes `cache/sample_predictions.csv` (plus `cache/sample_evaluation.json`), and `--cases` writes `cache/partial_predictions.csv`. Every run also writes `cache/case_results.jsonl` with the full per-case trace: intent, identity, report, validation errors and flags.
+
+**Sample results with the fallback report (no agent yet):** status accuracy 1.000, step precision 0.976, recall 0.850, F1 0.909, field accuracy 0.747, sequence accuracy 0.312. Every missed step except two cases belongs to the agreed unlinkable resources. Wherever all of a case's resources are linked, step order matches gold exactly. The remaining fallback errors are adjudication calls left for the agent:
+- case_12: `analytics_9914` is a contact record found by an old email hash; gold deletes it, the fallback anonymizes it.
+- case_17: the extra older account `account_6523`.
+
+### 2.8 Stage 4 as built (`code/stages/adjudicator/`)
+- **Framework.** Strands Agents 1.62 (`strands-agents[anthropic]`) on `claude-opus-5-5`, effort `medium`, `fallbacks: "default"`. Strands pins `anthropic<1.0`, so the SDK is pinned to `anthropic==0.125.0`; it supports every parameter stage 1 uses.
+- **When it runs (`selection.py`).** Only cases whose bundle has an open question go to the agent:
+  - unknown data category (support message vs attachment);
+  - an analytics record that is neither identifiable nor anonymized;
+  - more than one linked account;
+  - a catalog-only link;
+  - newest evidence disagreeing with the newest citable evidence;
+  - uncitable state in a case that would be COMPLETE;
+  - a violation the fallback had to exclude.
+
+  Post-audit links are *not* sent to the agent, because retrieval already applies the decided rule. Flagged: 5/32 samples, about 60/518 evaluation cases. Everything else keeps the deterministic draft report.
+- **Tools (`tools.py`).** Read-only, bound to one case, every query cut at `audit_at`:
+  - `get_resource_timeline`
+  - `read_evidence` (parsed record plus raw log lines, hiding lines after `audit_at`)
+  - `get_trace`
+  - `search_identifier` (exact; shows the owner, to rule out lookalikes)
+  - `submit_state_report`, which runs the stage-5 validator and returns errors, so the agent corrects its report within the same loop (at most 4 submissions)
+
+  Each tool call opens its own read-only SQLite connection, because Strands runs tools on its own threads. Tool failures are recorded and flagged (`AGENT_TOOL_ERRORS`).
+- **Runner (`runner.py`).** One agent per case, 4 cases in parallel. Limits: 20 turns and 400k tokens per case. Accepted reports are cached in `cache/adjudication_cache.json`, keyed by prompt version, model, effort, compact bundle and questions. Token usage goes to `cache/usage_log.jsonl`. No accepted report means the case keeps its draft report, is flagged, and a stage-4 error banner is shown.
+- **CLI.** `--agent flagged` (default), `all`, or `off`, plus `--agent-workers N`.
+- **Sample results with the agent:** status 1.000, step precision 0.994, recall 0.865, F1 0.925, field accuracy 0.755, sequence accuracy 0.344. Every agent report was accepted on the first submission in 4-5 turns, at about $0.12 per case.
+  - The agent fixed case_12: `analytics_9914` is a contact lookup keyed by an old email hash, so it is `SECONDARY_IDENTIFIER` and deleted.
+  - It confirmed case_07's attachment.
+  - Remaining non-gold step: case_17's older account `account_6523`, which is correctly linked but not in gold.
+
+### 2.9 Independent evaluation: OpenAI single-call judge (`code/evaluation/`)
+- **What it does.** `python code/evaluation/main.py` reviews the latest pipeline run (`cache/case_results.jsonl`). It makes one OpenAI Responses API call per case (`gpt-6.1-sol`, reasoning effort `low`) with a strict Pydantic schema. The judge sees:
+  - the request, the intent verdict, and the evidence bundle cut at `audit_at`;
+  - our per-resource decision basis (category, states, rationale);
+  - our status and steps.
+
+  It returns per-step agree/disagree/unsure with reasons, any missing steps, the status it expects, and a case verdict. It is advisory and never changes `output.csv`. A different provider from the pipeline avoids self-agreement bias.
+- **Cost and caching.** About $0.008 per case: 32 samples cost $0.26, so all 518 rows would be about $4. Verdicts are cached in `cache/judge_cache.json`, keyed by prompt version, model, effort and payload. Usage goes to `cache/usage_log.jsonl` with `provider: openai`, and the summary goes to `cache/judge_summary.json`.
+- **Calibration against gold (samples).** Sample runs score the judge itself against gold.
+  - **Without the decision basis (judge-v1),** it disagreed with case_12's correct reclassification, which gold agrees with.
+  - **With it (judge-v2),** it agreed with all 168 steps: 167 are correct by gold, and it missed the one wrong step (case_17's extra account).
+  - It cannot see unlinkable resources, so it finds none of the 26 gold steps we omit.
+
+  Conclusion so far: the judge confirms our outputs are well supported, but its ability to catch errors is still unmeasured. There is only one wrong step in the samples. Next step: a mutation test that injects known errors into sample outputs and measures how many the judge catches.
 
 ## 3. Stage 3: per-case retrieval (how a case pulls "all of my data")
 
@@ -209,7 +304,10 @@ Checks, each returning a specific error message:
 - Run the same pipeline on the 32 samples. Report status, step, field and sequence accuracy, which feeds `evaluation/evaluation_report.md`.
 - Log every model call's token usage, which feeds `evaluation/usage_report.md`.
 
-## 8. Open decisions
-1. Strategy for linking account/analytics resources that carry no identifier (§3.1, `account_4163`).
-2. Whether observations captured after `audit_at` may ever be used for *linkage only*. Current design: **no**. Everything is cut at `obs_time ≤ audit_at`. The case_30 check shows this is sufficient there.
-3. The retry budget N and fallback policy, to be tuned against the samples.
+## 8. Decisions
+1. **DECIDED: resources with no identifier link are not guessed.** A resource enters a case only through a proven link: an exact identifier, a trace, a query, a resource link, or a catalog claim (flagged). Records that can't be linked, such as deleted accounts known only by id, are left out, and the case is flagged `NO_ACCOUNT_RESOURCE_LINKED`. Ranking candidates by activity timing was rejected because it is rarely unique (4–68 candidates per window) and risks naming another person's record.
+2. **DECIDED: post-audit evidence may be used for linkage only, and only for records that already existed at the audit time.** An observation captured after `audit_at` may establish *that a resource belongs to the subject* (`link_basis=post_audit_identifier`), but only if the resource **also has its own observation at or before `audit_at`**. Later existence doesn't prove earlier existence: in this domain records are routinely created or recreated after the fact by re-signups, connector repopulation and restores. Post-audit evidence never contributes to state and is never cited. This recovers case_27's `account_3866`, which had a pre-audit 404. It excludes case_33's `account_2373`, `search_2352` and `audit_record_8486`, which first appear on 2026-09-15 against an audit of 2026-07-19. Excluded resources are listed in the bundle's `excluded` field with the reason.
+3. Open: the retry budget N and fallback policy, to be tuned against the samples.
+4. **DECIDED (fix round, see [evaluation_analysis.md](evaluation_analysis.md)): catalog claims count only inside the request window.** An unverified data-catalog ownership claim links a resource only if it was recorded between `requested_at` and `audit_at`. All 12 catalog claims fall inside exactly one case's window. The stale out-of-window matches are sample cases whose gold excludes the resource.
+5. **DECIDED: citation by state class.** PRESENT and IDENTIFIABLE are one "still holds data" class when choosing citable evidence. Aliases naming several resources resolve to the one whose system matches the evidence file's origin, if exactly one does.
+6. **DECIDED: judge model.** GPT-6.1 Sol at `low` effort: 0/32 false alarms and 61/61 planted errors caught, at about 1/5 of GPT-6 Astra's cost.
