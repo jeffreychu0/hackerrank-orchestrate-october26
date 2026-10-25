@@ -481,3 +481,26 @@ repo_root=E:\Work\Projects\HackerRank Orchestrate\hackerrank-orchestrate-october
 worktree=main
 parent_agent=none
 
+## 2026-10-25T07:13:23Z Write code/README.md
+
+User Prompt (verbatim, secrets redacted):
+using the docs that I have already created about the pipelines and approaches, make a README under the /code repo. I want you to highlight the full e2e workflow, the statistics for accuracy including F1 scores, the evaluation accuracy, etc. 
+
+Note the use of a cache when running the actual code is mainly to prevent multiple re-runs. The mix between deterministic and agentic running is to reduce cost and ensure that any deletion cases that can be solved through a deterministic workflow works. You should correclty highlight these distinctions.
+
+Lastly, highlight the fact that the evaluation workflow is mainly checking for obvious errors. A more accurate evaluation workflow would consider all data, but thats extremely expensive ($60 estimated), which was why I chose not to run the full version of evaluation
+
+Agent Response Summary:
+Wrote code/README.md from the existing docs: setup and run commands, the stage-by-stage end-to-end workflow with fail-loud gates and evidence rules, the deterministic-first / agent-on-ambiguity split (468 deterministic vs 50 agent cases) and why, the cache's role as re-run cost avoidance rather than stored answers, sample accuracy (F1 0.925 vs 0.928 ceiling, status 1.000), full-run statistics, the judge's scope as an obvious-error check with the ~$60 full-data evaluation deliberately not run, judge reliability across models, cost, layout and limitations.
+
+Actions:
+* Created code/README.md
+
+Context:
+tool=Claude Code
+model=claude-opus-5-5
+branch=main
+repo_root=E:\Work\Projects\HackerRank Orchestrate\hackerrank-orchestrate-october26
+worktree=main
+parent_agent=none
+
