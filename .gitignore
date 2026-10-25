@@ -1,0 +1,9 @@
+# Local environment and secrets
+.venv/
+venv/
+.env
+
+# Generated caches (rebuilt by code/build_index.py)
+cache/
+__pycache__/
+*.pyc
